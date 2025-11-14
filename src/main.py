@@ -11,11 +11,12 @@ import json
 import argparse
 from datetime import datetime
 from typing import Dict
+import tweepy
+from dotenv import load_dotenv
 
 from analyzer import TwitterSearcher
 from extractor import ControversyAnalyzer
 from keywords import CONTROVERSIAL_KEYWORDS
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -54,41 +55,93 @@ def analyze_profile(username: str, twitter_searcher: TwitterSearcher,
         sys.exit(1)
     
     all_results = []
-    total_tweets_found = 0
     controversial_tweets = []
     
-    print(f"searching for tweets containing {len(CONTROVERSIAL_KEYWORDS)} controversial keywords...\n")
+    print(f"searching for tweets containing {len(CONTROVERSIAL_KEYWORDS)} controversial keywords using batch search...\n")
     
-    # search for tweets with each keyword
-    for idx, keyword in enumerate(CONTROVERSIAL_KEYWORDS, 1):
-        print(f"[{idx}/{len(CONTROVERSIAL_KEYWORDS)}] searching for keyword: '{keyword}'...", end=" ", flush=True)
-
-        tweets = twitter_searcher.search_tweets_by_keyword(username, keyword)
-        total_tweets_found += len(tweets)
+    # batch search for all keywords at once using OR operators
+    try:
+        tweets = twitter_searcher.search_tweets_by_keywords_batch(username, CONTROVERSIAL_KEYWORDS)
+    except tweepy.BadRequest:
+        # query might be too long, fall back to individual searches
+        print("batch query failed (possibly too long), falling back to individual keyword searches...\n")
+        tweets = []
+        for idx, keyword in enumerate(CONTROVERSIAL_KEYWORDS, 1):
+            print(f"[{idx}/{len(CONTROVERSIAL_KEYWORDS)}] searching for keyword: '{keyword}'...", end=" ", flush=True)
+            keyword_tweets = twitter_searcher.search_tweets_by_keyword(username, keyword)
+            # add matched_keywords field for consistency
+            for tweet in keyword_tweets:
+                tweet['matched_keywords'] = [keyword]
+            tweets.extend(keyword_tweets)
+            print(f"found {len(keyword_tweets)} tweet(s)")
+    
+    total_tweets_found = len(tweets)
+    
+    print(f"\nfound {total_tweets_found} total tweet(s) matching keywords\n")
+    
+    # track analyzed tweet IDs to avoid duplicate analysis
+    analyzed_tweet_ids = set()
+    
+    # analyze each tweet
+    for idx, tweet in enumerate(tweets, 1):
+        tweet_id = tweet['id']
         
-        print(f"Found {len(tweets)} tweet(s)")
+        # skip if already analyzed (shouldn't happen with batch search, but safe guard)
+        if tweet_id in analyzed_tweet_ids:
+            continue
         
-        # analyze each tweet
-        for tweet in tweets:
-            print(f"analyzing tweet id: {tweet['id']}...", end=" ", flush=True)
-            analysis = analyzer.analyze_controversy(tweet['text'])
-            
+        analyzed_tweet_ids.add(tweet_id)
+        
+        matched_keywords = tweet.get('matched_keywords', [])
+        keyword_display = ', '.join(matched_keywords) if matched_keywords else 'unknown'
+        
+        print(f"[{idx}/{total_tweets_found}] analyzing tweet id: {tweet_id} (keywords: {keyword_display})...", end=" ", flush=True)
+        analysis = analyzer.analyze_controversy(tweet['text'])
+        
+        # create result for each matched keyword (for backward compatibility with reporting)
+        for keyword in matched_keywords:
             result = {
-                'tweet_id': tweet['id'],
+                'tweet_id': tweet_id,
                 'text': tweet['text'],
                 'created_at': tweet['created_at'],
                 'keyword': keyword,
+                'matched_keywords': matched_keywords,  # include all matched keywords
                 'public_metrics': tweet['public_metrics'],
                 'analysis': analysis
             }
             
             all_results.append(result)
-            
-            if analysis['is_controversial']:
-                controversial_tweets.append(result)
-                print(f"CONTROVERSIAL (score: {analysis['controversy_score']}/10)")
-            else:
-                print(f"Not controversial (score: {analysis['controversy_score']}/10)")
+        
+        # add to controversial tweets only once per tweet (deduplicated)
+        if analysis['is_controversial']:
+            # use first matched keyword for the controversial tweet entry
+            primary_keyword = matched_keywords[0] if matched_keywords else 'unknown'
+            controversial_result = {
+                'tweet_id': tweet_id,
+                'text': tweet['text'],
+                'created_at': tweet['created_at'],
+                'keyword': primary_keyword,
+                'matched_keywords': matched_keywords,
+                'public_metrics': tweet['public_metrics'],
+                'analysis': analysis
+            }
+            controversial_tweets.append(controversial_result)
+            print(f"CONTROVERSIAL (score: {analysis['controversy_score']}/10)")
+        else:
+            print(f"not controversial (score: {analysis['controversy_score']}/10)")
+        
+        # if no keywords matched (shouldn't happen, but handle gracefully)
+        if not matched_keywords:
+            result = {
+                'tweet_id': tweet_id,
+                'text': tweet['text'],
+                'created_at': tweet['created_at'],
+                'keyword': 'unknown',
+                'matched_keywords': [],
+                'public_metrics': tweet['public_metrics'],
+                'analysis': analysis
+            }
+            all_results.append(result)
     
     return {
         'username': username,
@@ -160,8 +213,8 @@ def main():
     )
     parser.add_argument(
         '-o', '--output',
-        default='controversy_analysis.json',
-        help='output json file path (default: controversy_analysis.json)'
+        default='output.json',
+        help='output json file path (default: output.json)'
     )
     
     args = parser.parse_args()
